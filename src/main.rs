@@ -1,22 +1,53 @@
-use axum::Router;
 use axum::extract::{Path, RawQuery};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
+use axum::{Router, extract};
 use bytes::Bytes;
 use cookie::CookieBuilder;
 use lazy_static::lazy_static;
 use regex::{Captures, Regex, Replacer};
 use reqwest::redirect::Policy;
 use reqwest::{Body, Client, ClientBuilder, Url};
-use std::collections::HashSet;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::string::ToString;
+use tower::ServiceBuilder;
+use tower_http::services::ServeDir;
 
 lazy_static! {
     static ref client: Client = ClientBuilder::new()
         .redirect(Policy::none())
         .build()
         .unwrap();
+}
+
+#[derive(Deserialize)]
+struct CheckToken {
+    token: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct TrunstileResponse {
+    success: bool,
+    challenge_ts: Option<String>,
+    hostname: Option<String>,
+    error_codes: Option<Vec<String>>,
+}
+
+async fn check_token(extract::Json(payload): extract::Json<CheckToken>) -> impl IntoResponse {
+    let mut params = HashMap::new();
+    params.insert("secret", "0x4AAAAAABeFSCrjw82cBO7ToMQiCrevAYY");
+    params.insert("response", &payload.token);
+    let res = client
+        .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
+        .json(&params)
+        .send()
+        .await
+        .unwrap();
+
+    let result: TrunstileResponse = res.json().await.unwrap();
+    println!("Result: {:?}", result);
 }
 
 async fn get_root(
@@ -188,7 +219,12 @@ async fn main() {
         .route("/{*path}", get(get_root))
         .route("/{*path}", delete(get_root))
         .route("/{*path}", post(get_root))
-        .route("/{*path}", put(get_root));
+        .route("/{*path}", put(get_root))
+        .route("/_clearance/check", post(check_token))
+        .nest_service(
+            "/_clearance",
+            ServiceBuilder::new().service(ServeDir::new("static")),
+        );
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:53001")
         .await

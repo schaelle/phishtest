@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Phishtest.cloud clearance</title>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" defer></script>
+</head>
+<body>
+<script type="application/javascript">
+    async function javascriptCallback(data) {
+        await fetch('/_clearance/check', {
+            "method": "POST",
+            "headers": {
+                "Content-Type": "application/json"
+            },
+            "body": JSON.stringify({token: data})
+        });
+    }
+</script>
+<main>
+    <div
+            class="cf-turnstile"
+            data-sitekey="0x4AAAAAABeFSB330iY0opZC"
+            data-callback="javascriptCallback"
+    ></div>
+</main>
+</body>
+</html>

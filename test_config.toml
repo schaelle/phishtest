@@ -1,0 +1,32 @@
+[turnstile]
+secret = "turnstile1"
+
+[[targets]]
+url = ["path1/.*"]
+[targets.static_response]
+status = 404
+
+[[targets]]
+url = ["path1/.*", "path2/.*"]
+[targets.static_response]
+status = 202
+
+[[targets]]
+url = [".*"]
+
+[targets.request]
+rewrite = true
+[targets.response]
+rewrite = true
+
+[[targets.response.headers]]
+key = "Referrer-Policy"
+value = "same-origin"
+
+[[targets]]
+url = ["url2"]
+
+[[targets.response.headers]]
+key = "header2"
+value = "value2"
+

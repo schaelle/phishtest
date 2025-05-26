@@ -1,0 +1,32 @@
+
+
+[turnstile]
+secret = "0x4AAAAAABeFSCrjw82cBO7ToMQiCrevAYY"
+
+[[targets]]
+url = ["rfdwdc/.*", "unsupported-browser/.*", "fcs2/.*"]
+[targets.static_response]
+status = 404
+
+[[targets]]
+url = [".*"]
+
+[targets.request]
+rewrite = true
+[[targets.request.headers]]
+key = "referer"
+
+[[targets.response.headers]]
+key = "Content-Security-Policy"
+value = "default-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval'"
+#value = "default-src 'self' http://*.{domain}/ data:; style-src 'self' http://*.{domain}/ 'unsafe-inline'; script-src 'self' http://*.{domain}/ 'unsafe-inline' 'unsafe-eval'"
+
+[[targets.response.headers]]
+key = "x-content-security-policy"
+
+[targets.response]
+rewrite = true
+[[targets.response.headers]]
+key = "Referrer-Policy"
+value = "same-origin"
+

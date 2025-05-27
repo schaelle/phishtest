@@ -1,4 +1,4 @@
-
+domains = ["login.raiffeisen.ch", "ebanking.raiffeisen.ch", "www.postfinance.ch", "bqztzw.postfinance.ch"]
 
 [turnstile]
 secret = "0x4AAAAAABeFSCrjw82cBO7ToMQiCrevAYY"

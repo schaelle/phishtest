@@ -1,3 +1,5 @@
+domains = ["domain1"]
+
 [turnstile]
 secret = "turnstile1"
 

@@ -14,6 +14,8 @@ pub struct Config {
     pub turnstile: TurnstileConfig,
 
     pub targets: Option<Vec<Targets>>,
+    
+    pub domains: Vec<String>
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Clone)]
@@ -69,6 +71,7 @@ mod tests {
             turnstile: TurnstileConfig {
                 secret: "turnstile1".to_string(),
             },
+            domains: vec!["domain1".to_string()],
             targets: Some(vec![
                 Targets {
                     url: vec!["path1/.*".to_string()],

@@ -225,7 +225,7 @@ async fn get_root(
         response_headers.insert(key, value.clone());
     }
 
-    let validator = HashSet::from(["login.raiffeisen.ch", "ebanking.raiffeisen.ch", "www.postfinance.ch"]);
+    let validator = HashSet::from_iter(config.map(|i|i.domains).unwrap_or_else(|| Vec::new()));
 
     response_headers.remove("transfer-encoding");
     response_headers.remove("content-length");
@@ -368,6 +368,12 @@ trait DomainValidator {
 }
 
 impl DomainValidator for HashSet<&str> {
+    fn validate(&self, domain: &str) -> bool {
+        self.contains(domain)
+    }
+}
+
+impl DomainValidator for HashSet<String> {
     fn validate(&self, domain: &str) -> bool {
         self.contains(domain)
     }

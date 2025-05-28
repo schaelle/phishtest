@@ -1,10 +1,13 @@
 mod clearance;
 mod config;
 mod csp;
+mod storage;
 mod turnstile;
 
-use crate::config::{load, Config, Mapping, Targets};
-use axum::extract::{Path, Query, RawQuery};
+extern crate dotenv;
+
+use crate::config::{Config, Mapping, Targets, load};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
@@ -17,12 +20,14 @@ use regex::{Captures, Regex, Replacer};
 use reqwest::redirect::Policy;
 use reqwest::{Body, Client, ClientBuilder, Url};
 use serde::Deserialize;
+use sqlx::{Pool, Sqlite, SqlitePool};
 use std::collections::HashSet;
-use std::path;
 use std::string::ToString;
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
+use std::{fs, path};
 use tower::ServiceBuilder;
 use tower_http::services::ServeDir;
+use ulid::Ulid;
 
 lazy_static! {
     static ref client: Client = ClientBuilder::new()
@@ -99,7 +104,7 @@ fn filter_headers<TTransformer>(
             if let Some(value) = &header_config.value {
                 let key = HeaderName::from_bytes(header_config.key.as_bytes()).unwrap();
                 request_header.insert(key, value.parse().unwrap());
-            }else{
+            } else {
                 request_header.remove(&header_config.key);
             }
         }
@@ -119,8 +124,9 @@ async fn get_root(
     path: Option<Path<String>>,
     method: Method,
     RawQuery(params): RawQuery,
+    State(pool): State<Pool<Sqlite>>,
     mut request_header: HeaderMap,
-    mut body: Bytes,
+    request_body: Bytes,
 ) -> impl IntoResponse {
     let domain = "local-dev.phishtest.cloud:53001";
 
@@ -147,7 +153,6 @@ async fn get_root(
 
     let host: &str = request_header.get("Host").unwrap().to_str().unwrap();
     let subdomain = host.split(".").next().unwrap();
-    // println!("Host: {}->{}", host, subdomain);
 
     let data =
         base32::decode(base32::Alphabet::Rfc4648Lower { padding: false }, subdomain).unwrap();
@@ -157,7 +162,11 @@ async fn get_root(
 
     if let Some(target) = &target {
         if let Some(static_response) = &target.static_response {
-            return (StatusCode::from_u16(static_response.status).unwrap(), response_headers, Bytes::new());
+            return (
+                StatusCode::from_u16(static_response.status).unwrap(),
+                response_headers,
+                Bytes::new(),
+            );
         }
     }
 
@@ -193,14 +202,17 @@ async fn get_root(
     // println!("Url: {}", url);
 
     // transform post-body
-    if let Ok(string_post_content) = String::from_utf8(body.to_vec()) {
-        body = Bytes::from(reverse_translate_domains(string_post_content, domain));
-    }
+    let transformed_request_body =
+        if let Ok(string_post_content) = String::from_utf8(request_body.to_vec()) {
+            Bytes::from(reverse_translate_domains(string_post_content, domain))
+        } else {
+            request_body.clone()
+        };
 
     let res = client
-        .request(method, url)
-        .headers(request_header)
-        .body(Body::from(body))
+        .request(method.clone(), url.clone())
+        .headers(request_header.clone())
+        .body(transformed_request_body.clone())
         .send()
         .await
         .unwrap();
@@ -216,16 +228,16 @@ async fn get_root(
     println!("Response: {:?}", res);
 
     let status_code = res.status();
-    
+
     let ignored = HashSet::from(["set-cookie"]);
     for (key, value) in res.headers() {
         if ignored.contains(&key.as_str()) {
-           continue; 
+            continue;
         }
         response_headers.insert(key, value.clone());
     }
 
-    let validator = HashSet::from_iter(config.map(|i|i.domains).unwrap_or_else(|| Vec::new()));
+    let validator = HashSet::from_iter(config.map(|i| i.domains).unwrap_or_else(|| Vec::new()));
 
     response_headers.remove("transfer-encoding");
     response_headers.remove("content-length");
@@ -248,6 +260,18 @@ async fn get_root(
         content = Bytes::from(translate_domains(string_content, domain, true, validator));
     }
 
+    let session_id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+    storage::add_request(
+        &pool,
+        session_id,
+        url.as_str(),
+        method.as_str(),
+        &request_header,
+        request_body.to_vec(),
+        transformed_request_body.to_vec()
+    )
+    .await;
+
     // builder.body(content).unwrap()
     // (headers, )
     (status_code, response_headers, content)
@@ -255,6 +279,12 @@ async fn get_root(
 
 #[tokio::main]
 async fn main() {
+    // fs::remove_file("db.sqlite").unwrap();
+
+    let pool = SqlitePool::connect(&"db.sqlite").await.unwrap();
+
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
     let (tx, rx) = mpsc::channel();
 
     let mut watcher = notify::recommended_watcher(tx).unwrap();
@@ -294,6 +324,7 @@ async fn main() {
         .route("/{*path}", put(get_root))
         .route("/_api/csp", post(csp_report))
         .route("/_clearance/check", post(check_token))
+        .with_state(pool)
         .nest_service(
             "/_clearance",
             ServiceBuilder::new().service(ServeDir::new("static")),

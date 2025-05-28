@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8", features = ["json", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
-reqwest = { version = "0", features = ["cookies", "json"] }
+reqwest = { version = "0", features = ["cookies", "json", "rustls-tls"] }
 bytes = "1"
 base64 = "0"
 base32 = "0"
@@ -14,11 +14,11 @@ regex = "1.11.1"
 cookie = "0.18"
 lazy_static = "1.5.0"
 tower = "0.5.2"
-tower-http = { version = "0.6.4", features = ["full"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_derive = "1.0.219"
+tower-http = { version = "0.6", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_derive = "1.0"
 chacha20poly1305= "0.10.1"
-uuid = { version = "1.16.0", features = ["v4", "serde"] }
+uuid = { version = "1.17", features = ["v4", "serde"] }
 ulid = { version = "1.2.1", features = ["serde"] }
 http-serde = "2.1.1"
 serde_json = "1.0"

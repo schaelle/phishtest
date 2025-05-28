@@ -31,6 +31,7 @@ use ulid::Ulid;
 
 lazy_static! {
     static ref client: Client = ClientBuilder::new()
+        .use_rustls_tls()
         .redirect(Policy::none())
         .build()
         .unwrap();
@@ -268,7 +269,7 @@ async fn get_root(
         method.as_str(),
         &request_header,
         request_body.to_vec(),
-        transformed_request_body.to_vec()
+        transformed_request_body.to_vec(),
     )
     .await;
 
